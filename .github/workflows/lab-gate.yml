@@ -148,9 +148,15 @@ jobs:
 
           head, path = sys.argv[1:]
           pages = json.load(open(path, encoding="utf-8"))
+          trusted_login = "chatgpt-codex-connector[bot]"
+          trusted_user_id = 199175422
           for comment in reversed([row for page in pages for row in page]):
-              login = (comment.get("user") or {}).get("login", "")
-              if not login.startswith("chatgpt-codex-connector"):
+              user = comment.get("user") or {}
+              if (
+                  user.get("login") != trusted_login
+                  or user.get("type") != "Bot"
+                  or user.get("id") != trusted_user_id
+              ):
                   continue
               match = re.search(r"codex-review-state:v1 (\{.*?\}) -->", comment.get("body", ""))
               if not match:
