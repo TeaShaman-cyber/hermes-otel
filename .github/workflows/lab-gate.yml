@@ -1,0 +1,263 @@
+name: lab-gate
+
+# Our own gate for the plugin fork. Upstream runs its CI on PRs that target
+# briancaffey/hermes-otel; this workflow runs on PRs that target *this* fork,
+# so a change can be rejected here before it is ever offered upstream.
+#
+# Three verdicts per commit, same shape as local-lab plus the publication gate:
+#   gate-checks  deterministic checks, always produces a verdict.
+#   gate-review  outside review on the exact head — the Codex connector either
+#                leaves a review, a receipt comment, or a thumbs-up. Waiting
+#                here instead of re-running keeps one verdict per commit.
+#   live-acceptance  for an upstream-linked target, validates the exact-head
+#                    receipt versioned in TeaShaman-cyber/local-lab.
+#
+# The upstream CI stays authoritative for the upstream PR; this gate is what
+# makes our side of the handoff verifiable by another agent.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: lab-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate-checks:
+    name: gate-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      need_review: ${{ steps.need.outputs.required }}
+    steps:
+      - name: Check out the pull-request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A checkout that silently moved would make every later verdict describe
+      # a different commit than the one under review.
+      - name: Verify source identity
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          observed="$(git rev-parse HEAD)"
+          if [ "$observed" != "$EXPECTED_SHA" ]; then
+            printf 'GATE_SOURCE_MISMATCH expected=%s observed=%s\n' "$EXPECTED_SHA" "$observed" >&2
+            exit 2
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.8"
+
+      # Delegated to the repository's own target on purpose: this gate must
+      # track upstream's definition of CI, not a private copy of it that drifts.
+      - name: make ci
+        run: make ci
+
+      # The build steps rewrite generated files. A gate that leaves the tree
+      # dirty has proved something different from what it claims.
+      - name: The tree is unchanged after the checks
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::make ci left the working tree dirty"
+            git status --porcelain
+            exit 1
+          fi
+
+      - name: Does this change need an outside review
+        id: need
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Every change here touches shutdown or telemetry durability, so the
+          # default is "review required"; only a docs-only change is exempt.
+          if [ -z "${BASE:-}" ] || [ -z "${HEAD:-}" ]; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$BASE" "$HEAD" > changed.txt
+          echo "--- changed ---"
+          cat changed.txt
+          if grep -qvE '^(docs/|website/|marketing/|README|CHANGELOG|.*\.md$)' changed.txt; then
+            echo "required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "required=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  gate-review:
+    name: gate-review
+    needs: gate-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Docs only — nothing to wait for
+        if: needs.gate-checks.outputs.need_review != 'true'
+        run: echo "Docs-only change — no outside review required."
+
+      - name: Wait for an outside review of this exact head
+        if: needs.gate-checks.outputs.need_review == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR:-}" ]; then
+            echo "::error::Not a pull request — gate-review needs a PR number."
+            exit 1
+          fi
+
+          head_date=$(gh api "repos/$REPO/commits/$HEAD" --jq '.commit.committer.date')
+          echo "waiting for review of $HEAD (committed $head_date)"
+
+          # Codex's summary comment carries both the exact commit SHA and the
+          # unresolved-findings state. A PR-level reaction does not identify a
+          # commit and cannot satisfy this gate. Human approval is accepted
+          # only when its review object names the exact head.
+          for attempt in $(seq 1 30); do
+            gh api "repos/$REPO/issues/$PR/comments" --paginate --slurp \
+              > /tmp/comments.json
+            codex_state=$(python - "$HEAD" /tmp/comments.json <<'PY'
+          import json
+          import re
+          import sys
+
+          head, path = sys.argv[1:]
+          pages = json.load(open(path, encoding="utf-8"))
+          trusted_login = "chatgpt-codex-connector[bot]"
+          trusted_user_id = 199175422
+          for comment in reversed([row for page in pages for row in page]):
+              user = comment.get("user") or {}
+              if (
+                  user.get("login") != trusted_login
+                  or user.get("type") != "Bot"
+                  or user.get("id") != trusted_user_id
+              ):
+                  continue
+              match = re.search(r"codex-review-state:v1 (\{.*?\}) -->", comment.get("body", ""))
+              if not match:
+                  continue
+              state = json.loads(match.group(1))["code_review"]
+              if state.get("commit_sha") != head:
+                  continue
+              if state.get("status") != "completed":
+                  print("running")
+              elif state.get("has_unresolved_findings"):
+                  print("findings")
+              else:
+                  print("clean")
+              break
+          else:
+              print("missing")
+          PY
+            )
+            case "$codex_state" in
+              clean)
+                echo "PASS: Codex completed $HEAD with no unresolved findings"
+                exit 0
+                ;;
+              findings)
+                echo "::error::Codex has unresolved findings on $HEAD"
+                exit 1
+                ;;
+            esac
+
+            human=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate --slurp \
+              --jq "[.[][] | select(.state == \"APPROVED\" and .commit_id == \"$HEAD\" and ((.user.login | startswith(\"chatgpt-codex-connector\")) | not))] | length")
+            if [ "$human" -gt 0 ]; then
+              echo "PASS: human approval on $HEAD ($human)"
+              exit 0
+            fi
+
+            echo "attempt $attempt/30: no outside review yet, waiting 20s"
+            sleep 20
+          done
+
+          echo "::error::No outside review on $HEAD after 10 minutes."
+          echo "Ask for one: comment '@codex review' on the PR."
+          echo "Deterministic checks passed — this is the review requirement, not a code defect."
+          exit 1
+
+  live-acceptance:
+    name: live-acceptance
+    needs: gate-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide whether this target publishes upstream
+        id: route
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          case "$BASE_REF" in
+            upstream/*|fix/windows-livestore-logs-shutdown)
+              echo "required=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "required=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Internal branch — live receipt is not a publication gate
+        if: steps.route.outputs.required != 'true'
+        run: echo "Target ${{ github.base_ref }} is not upstream-linked."
+
+      - name: Check out the exact candidate head
+        if: steps.route.outputs.required == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: candidate
+          persist-credentials: false
+
+      - name: Check out canonical live receipts and checker
+        if: steps.route.outputs.required == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: TeaShaman-cyber/local-lab
+          ref: main
+          path: local-lab
+          persist-credentials: false
+
+      - name: Validate exact-SHA live acceptance
+        if: steps.route.outputs.required == 'true'
+        env:
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          receipt="local-lab/receipts/upstream-live/$HEAD.json"
+          if [ ! -f "$receipt" ]; then
+            echo "::error::BLOCKED: no exact-SHA live receipt for $HEAD"
+            echo "Expected versioned receipt: $receipt"
+            exit 1
+          fi
+          python local-lab/tools/contracts/check_upstream_promotion.py \
+            --receipt "$receipt" \
+            --candidate-repo candidate \
+            --expected-sha "$HEAD"
